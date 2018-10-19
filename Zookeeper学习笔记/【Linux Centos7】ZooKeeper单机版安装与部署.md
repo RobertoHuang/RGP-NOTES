@@ -1,0 +1,132 @@
+# `Zookeeper单机版安装`
+
+>  关于我:[http://huangth.com](http://huangth.com)
+>
+>  GitHub地址:[https://github.com/RobertoHuang](https://github.com/RobertoHuang)
+
+- 下载`Zookeeper`
+
+- 解压`Zookeeper`安装包
+
+  ```shell
+  # tar -zxvf zookeeper-3.4.8.tar.gz
+  ```
+
+- 配置`Zookeeper`文件及日志目录
+
+  - 创建保存文件及日志的目录
+
+    ```shell
+    # mkdir data
+    # mkdir logs
+    ```
+
+  - 修改`Zookeeper`的配置文件
+
+    - 将`zookeeper-3.4.8/conf`目录下的`zoo_sample.cfg`文件拷贝一份命名为为`zoo.cfg`
+
+      ```shell
+      # cp zoo_sample.cfg zoo.cfg
+      ```
+
+    - 编辑`zoo.cfg`将`zookeeper`的`dataDir`和`dataLogDir`指向之前创建好的文件及日志目录
+
+      ```shell
+      # The number of milliseconds of each tick
+      tickTime=2000
+      
+      # The number of ticks that the initial
+      # synchronization phase can take
+      initLimit=10
+      
+      # The number of ticks that can pass between
+      # sending a request and getting an acknowledgement
+      syncLimit=5
+      
+      # the directory where the snapshot is stored.
+      # do not use /tmp for storage, /tmp here is just
+      # example sakes.
+      dataDir=/opt/zookeeper/data
+      dataLogDir=/opt/zookeeper/logs
+      
+      # the port at which the clients will connect
+      clientPort=2181
+      
+      server.1=localhost:2888:3888
+      ```
+
+    - 在`dataDir`下创建`myid`文件(编辑`myid`文件并在对应的`IP`的机器上输入对应的编号)
+
+      ```shell
+      # echo 1 > myid
+      ```
+
+- 添加`Zookeeper`环境变量配置(修改`/etc/profile`添加如下配置)，并使环境变量配置生效
+
+  ```shell
+  ZOOKEEPER_HOME=/opt/zookeeper/zookeeper-3.4.8
+  export PATH=$ZOOKEEPER_HOME/bin:$PATH
+  ```
+
+  ```shell
+  # source /etc/profile
+  ```
+
+- 启动并测试`Zookeeper`
+
+  ```shell
+  # 启动Zookeeper
+  zkServer.sh start
+   
+  # 查看Zookeeper状态
+  zkServer.sh status
+   
+  # 服务器输出信息
+  tail -500f zookeeper.out
+   
+  # 停止zookeeper
+  zkServer.sh stop
+  ```
+
+- 设置`Zookeeper`服务开机启动
+
+  - 在`/etc/rc.d/init.d`添加可执行文件`zookeeper`
+
+    ```shell
+    # 切换到/etc/rc.d/init.d/目录下
+    # cd /etc/rc.d/init.d
+    
+    # 创建zookeeper文件
+    # touch zookeeper
+    
+    # 将zookeeper修改为可执行文件
+    # chmod +x zookeeper
+    
+    # 编辑文件，在zookeeper里面输入如下内容
+    #!/bin/bash
+    #chkconfig:2345 20 90
+    #description:zookeeper
+    #processname:zookeeper
+    export JAVA_HOME=/opt/java/jdk1.8.0_91
+    export PATH=$JAVA_HOME/bin:$PATH
+    case $1 in
+         start) su root /opt/zookeeper/zookeeper-3.4.8/bin/zkServer.sh start;;
+         stop) su root /opt/zookeeper/zookeeper-3.4.8/bin/zkServer.sh stop;;
+         status) su root /opt/zookeeper/zookeeper-3.4.8/bin/zkServer.sh status;;
+         restart) su root /opt/zookeeper/zookeeper-3.4.8/bin/zkServer.sh restart;;
+         *) echo "require start|stop|status|restart";;
+    esac
+    ```
+
+  - 这个时候我们就可以用`service zookeeper start/stop`来启动停止`Zookeeper`服务了
+
+  - 使用命令把`zookeeper`添加到开机启动任务中
+
+    ```shell
+    # chkconfig zookeeper on
+    # chkconfig --add zookeeper
+    ```
+
+  - 添加完成之后接这个使用`chkconfig --list`来看看我们添加的`zookeeper`是否在里面
+
+  - 如果上面的操作都正常的话，你就可以重启你的`Linux`服务器了
