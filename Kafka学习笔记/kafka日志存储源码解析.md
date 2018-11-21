@@ -8,21 +8,11 @@
 >
 > 日志的文件名命名规则为`[baseOffset].log`，`baseOffset`是日志中第一条消息的`offset`
 
-## `ByteBufferMessageSet`
+## `FileRecords`
 
-> 底层使用`ByteBuffer`保存数据，主要提供如下功能
+> 从文件中读取消息，并提供遍历消息功能
 
-- `create`将消息按照指定的压缩类型进行压缩
-
-- 
-
-
-- 消息压缩
-- 迭代压缩消息
-
-## `MemoryRecordsBuilder`
-
-
+关于`FileRecords`详细解析可参考:[FileRecords详解](http://www.voidcn.com/article/p-xagajpcq-brh.html)
 
 ## `OffsetIndex`
 
@@ -63,76 +53,82 @@
 - activeSegment活动的日志分段【保证顺序写入】
 ```
 
-`append`在`Log`中一个最重要的方法就是日志的写入【追加日志】
+- `loadSegments`从磁盘`Log`文件中载入`Segment`
 
-- `analyzeAndValidateRecords`校验消息及计算部分数据
-- `trimInvalidBytes`删除这批消息中无效的消息
+  - 清理临时文件【`.delete`和`.cleaned`结尾的文件】，收集`Swap`文件
+  - 加载`Segment`和`Index`文件，将`Segment`依次加入`cache`中
+  - 完成被中断的`swap`操作【载入`SwapSegment`并替换对应`Segment`，为了保持不`crash`系统旧的`log`文件添加`.deleted`后缀，后面的定时任务或者下次的系统重启会删除】
+  - 对于空的`Log`需要创建`activeSegment`保证`Log`中至少有一个`LogSegment`，否则执行恢复操作
 
-- `validateMessagesAndAssignOffsets`为每条消息设置绝对偏移量和时间戳
-- `maybeRoll`是否需要创建新的`activeSegment`
-  - 本次待追加的消息集合大小超过配置`LogSegment`的最大长度
-  - 距离上次日志分段的时间是否达到了设置的阈值
-  - 索引文件满了/消息最大位移和基础位移大小差值超过`int`最大值
-- `segment.append`往`segment`中追加数据
-- 更新`logEndOffset`并判断是否需要刷新磁盘【如果需要的话调用`flush()`方法刷到磁盘】
+- `append`在`Log`中一个最重要的方法就是日志的写入【追加日志】
+  - `analyzeAndValidateRecords`校验消息及计算部分数据
+  - `trimInvalidBytes`删除这批消息中无效的消息
 
-`roll`当满足特定条件后将会创建新的`segment`对象用来保存数据【滚动日志】
+  - `validateMessagesAndAssignOffsets`为每条消息设置绝对偏移量和时间戳
+  - `maybeRoll`是否需要创建新的`activeSegment`
+    - 本次待追加的消息集合大小超过配置`LogSegment`的最大长度
+    - 距离上次日志分段的时间是否达到了设置的阈值
+    - 索引文件满了/消息最大位移和基础位移大小差值超过`int`最大值
+  - `segment.append`往`segment`中追加数据
+  - 更新`logEndOffset`并判断是否需要刷新磁盘【如果需要的话调用`flush()`方法刷到磁盘】
 
-- 创建新的日志文件和索引文件
-- 创建对应的`segment`对象并添加到跳表中
-- 更新`activeSegment.baseOffset`和`activeSegment.size`
-- 使用`KafkaScheduler`执行`flush-log`任务【`KafkaScheduler`本质是将`fun`封装成`Runable`】
+- `roll`当满足特定条件后将会创建新的`segment`对象用来保存数据【滚动日志】
+  - 创建新的日志文件和索引文件
+  - 创建对应的`segment`对象并添加到跳表中
+  - 更新`activeSegment.baseOffset`和`activeSegment.size`
+  - 使用`KafkaScheduler`执行`flush-log`任务【`KafkaScheduler`本质是将`fun`封装成`Runable`】
 
-`flush`将`recoverPoint~LEO`之间的消息数据刷新到磁盘并修改`recoverPoint`的值
+- `flush`将`recoverPoint~LEO`之间的消息数据刷新到磁盘并修改`recoverPoint`的值
+  - 通过对`segments`调表操作查找`recoverPoint`和`offset`之间的`LogSegment`对象
+  - 调用`segment.flush`将数据刷新到磁盘【保证数据持久性】
 
-- 通过对`segments`调表操作查找`recoverPoint`和`offset`之间的`LogSegment`对象
-- 调用`segment.flush`将数据刷新到磁盘【保证数据持久性】
+- `read`日志的读取【将`nextOffsetMetadata`保存成方法局部变量保证线程安全】
+  - 日志边界检查
 
-`read`日志的读取【将`nextOffsetMetadata`保存成方法局部变量保证线程安全】
+  - 根据是否是`activeSegment`处理`maxPosition`
 
-- 日志边界检查
+    ```reStructuredText
+    如果Fetch请求刚好发生在activeSegment上，当多个Fetch请求同时处理如果nextOffsetMetadata更新不及时,可能会导致发生OffsetOutOfRangeException异常。为了解决这个问题这里能读取的最大位置是对应的物理位置exposedPos而不是activeSegment的LEO
+    ```
 
-- 根据是否是`activeSegment`处理`maxPosition`
+  - 调用`segment.read`方法读取数据，如果没读取到数据则读取下一个`LogSegment`
 
-  ```reStructuredText
-  如果Fetch请求刚好发生在activeSegment上，当多个Fetch请求同时处理如果nextOffsetMetadata更新不及时,可能会导致发生OffsetOutOfRangeException异常。为了解决这个问题这里能读取的最大位置是对应的物理位置exposedPos而不是activeSegment的LEO
-  ```
-
-- 调用`segment.read`方法读取数据，如果没读取到数据则读取下一个`LogSegment`
 
 ##  `LogManager`
 
-- 定时任务
-  - `cleanupLogs`清理`LogSegment`工作【`LogSegment`的存活时长/整合`Log`的大小】
-    - 根据日志保留时间【当前时间-最后修改时间<`retention.ms`】
-    - 根据`Log`大小【`diff - segment.size >= 0` `diff`为超过日志存储最大值部分的数据】
-    - 一下个`Segment`的`baseOffset`依旧小于`logStartOffset`
-  - `flushDirtyLogs`刷新日志文件【日志未刷新时间>此`Log`的`flush.ms`配置项指定的时长】
-  - `checkpointLogRecoveryOffsets`更新`RecoveryPointCheckPoint`文件
-  - `checkpointLogStartOffsets`更新`checkpoint`的`start offset`，避免读取到已删除数据
-  - `deleteLogs`定期删除`logsToBeDeleted`列表中的数据
-    - `LogManager`启动时会扫描所有分区目录名结尾是`-delete`的分区加入到`logsToBeDeleted`中【把需要先把分区目录标记一下在后缀加上`-delete`表示该分区准备删除了，这样做可以防止如果删除时间没到就宕机下次重启时可以扫描`-delete`结尾的分区再删除】
-    - 分区被删除的时候走的都是异步删除策略会先被加入到`logsToBeDeleted`中等待删除
+> `LogManager`初始化过程主要完成如下功能
+>
+> - 启动定时任务
+> - 调用`createAndValidateLogDirs`和`loadLogs`
+> - 启动`Cleaner`后台线程用于日志的压缩清理工作【根据配置决定】
+
 - 初始化过程
   - `createAndValidateLogDirs`检查日志目录
+
     - 确保数据目录中没有重复的数据目录
-    - 确保给定的目录不包含在脱机目录内
-    - 数据目录不存在的话就创建相应的目录
+    - 确保`liveLogDirs`与`offlineLogDirs`日志目录不能有重叠
+    - 如果数据目录不存在的话就创建相应的目录
     - 检查每个目录路径是否是可读的
   - `loadLogs`加载所有日志分区
-    - 为每个`Log`目录分配一个有`recoveryThreadsPerDataDir`条线程数的线程池
-    - 检测`Broker`上次关闭是否正常并设置`Broker`状态【在`Broker`正常关闭时会创建一个`.kafka_cleanshutdown`文件，这里就是通过此文件进行判断的】
-    - 载入每个`Log`的`recoveryPoints`【用于恢复】
-    - 为每个`Log`创建一个恢复任务交给线程池处理
-    - 主线程阻塞等待所有线程恢复任务完成并关闭之前创建的线程池
 
-## 检查点文件
-
-- `Kafka`启动时读取检查点文件把每个分区对应的检查点`CheckPoint`作为日志的恢复点`RecoveryPoint`
-- 消息追加到分区对应的日志，在刷新日志时将最新的偏移量作为日志的检查点(刷新日志时会更新检查点位置)
-- `LogManager`定时读取所有日志检查点，并写入全局检查点文件(定时将检查点的位置更新到检查点文件中)
-
-
+    - 为每个`Log`目录分配一个有`numRecoveryThreadsPerDataDir`条线程数的线程池
+    - 检测`Broker`上次是否正常关闭并设置`Broker`状态【通过`.kafka_cleanshutdown`文件判断】
+    - 从检查点文件读取`Topic`对应的恢复点`offset`信息【`recovery-point-offset-checkpoint`】
+    - 从检查点文件读取`Topic`对应的`startoffset`信息【`log-start-offset-checkpoint`】
+    - 为每个日志子目录创建一个任务(`loadLog`【`TopicPartition`生成`Log`对象】)并交给线程池处理
+    - 主线程阻塞等待所有线程任务完成，删除对应的`cleanShutdownFile`并关闭之前创建的线程池
+  - 定时任务【所有日志分区加载完毕后执行】
+    - `cleanupLogs`清理`LogSegment`工作【`LogSegment`的存活时长/整合`Log`的大小】
+      - 根据日志保留时间【当前时间-最后修改时间<`retention.ms`】
+      - 根据`Log`大小【`diff - segment.size >= 0` `diff`为超过日志存储最大值部分的数据】
+      - 下个`Segment`的`baseOffset`依旧小于`logStartOffset`
+    - `flushDirtyLogs`刷新日志文件【日志未刷新时间>此`Log`的`flush.ms`配置项指定的时长】
+    - `checkpointLogRecoveryOffsets`更新`recovery-point-offset-checkpoint`文件
+    - `checkpointLogStartOffsets`更新`log-start-offset-checkpoint`文件避免读取到已删除数据
+    - `deleteLogs`定期删除`logsToBeDeleted`列表中的数据
+      - `LogManager`启动时会扫描所有分区目录名结尾是`-delete`的分区加入到`logsToBeDeleted`中【把需要先把分区目录标记一下在后缀加上`-delete`表示该分区准备删除了，这样做可以防止如果删除时间没到就宕机下次重启时可以扫描`-delete`结尾的分区再删除，保障可靠性】
+      - 分区被删除的时候走的都是异步删除策略会先被加入到`logsToBeDeleted`中等待删除
+- `LogManager`中还提供三个重要方法【`createLog`、`deleteLog()`、`getLog()`】
 
 ## `LogCompact`
 
@@ -212,3 +208,4 @@
   - 从过滤后的`LogToClean`列表中获取`cleanableRatio`最大的即为当前最需要被清理的`LogToClean`
 
 - `updateCheckpoints`每次清理完要更新当前已经清理到的位置, 记录在`cleaner-offset-checkpoint`文件
+
