@@ -59,7 +59,7 @@
 
 【`nPartitions:13`、`replicationFactor:3`、`brokerRackMapping:{0,1,2,3}`、`fixedStartIndex:4`】
 
-| 副本 |     分区      |
+| 分区 |     副本      |
 | :--: | :-----------: |
 |  0   | 【3   0   1】 |
 |  1   | 【0   1   2】 |
