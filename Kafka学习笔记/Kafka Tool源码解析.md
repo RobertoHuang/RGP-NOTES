@@ -12,4 +12,22 @@
     - 判断请求能否立即返回【`timeout <= 0 || validateOnly || 创建请求全失败了`】
     - 若有成功创建`Topic`请求需要新建`DelayedCreatePartitions`放入延迟任务队列中【因为要等待`Controller`监听到节点变化执行真正的创建副本等操作，在这些操作完成后`Controller`将会发出`UpdateMetadataRequest`，在`handleUpdateMetadataRequest`中将处理延迟队列中的任务】
 
-- `handleDeleteTopicsRequest`处理删除`Topic`请求
+- `TopicCommand.deleteTopic`删除`Topic`功能
+
+  - 筛选出需要删除的`Topic`【支持正则表达式】
+  - 在`ZK`的`/admin/delete_topics`节点上写入`Topic`信息
+
+- `TopicCommand.alterTopic`修改`Topic`的分区数量、副本的分配以及相关配置信息
+
+  【` --alter --zookeeper x --topic x --partitions x --replica-assignment 0,0`】
+
+  - 筛选出需要修改的`Topic`【支持正则表达式】
+  - 获取待修改的`Topic`已有的分区副本分配情况
+  - 如果已手动指定新增的副本分区分配则使用手动指定的副本分区分配，否则自动分配
+  - 将已存在的副本分区分配集合与新增的副本分区分配集合合并写入`ZK`【`/brokers/topics/topic`】
+
+- `PreferredReplicaLeaderElectionCommand`优先副本分配
+
+  - 判断`path-to-json-file`是否有指定文件，解析成`TopicPartition`
+  - 将解析后的`TopicPartition`数据写入`/admin/preferred_replica_election`节点
+  - 真正的副本分配工作是由`Controoler`监听`/admin/preferred_replica_election`节点变化完成的，即此处执行的代码作用是告知`Controller`哪些`TopicPartition`需要执行优先副本选举
