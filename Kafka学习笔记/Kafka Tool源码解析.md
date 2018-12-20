@@ -32,6 +32,19 @@
   - 将整合好的配置持久化到`ZK`节点【`/config/{configType}/xxx`上】
   - 将发生变化的配置写入`changes`节点【`config/changes/config_change_xxx`有序节点】
 
+- `ReassignPartitionsCommand`副本重新分配
+
+  - `--generate`生成重新分配策略
+    - 解析`topics-to-move-json-file`与`broker-list`
+    - `AdminUtils.assignReplicasToBrokers`进行副本分配【不会修改`Partition`与`Replica`数】
+  - `--execute`执行重新分配策略
+    - 解析`reassignment-json-file`
+    - 将副本重写分配方案写入**`/admin/reassign_partitions`**节点【副本转移与配额(略)】
+  - `--verify`验证副本重新分配是否成功
+    - 解析`reassignment-json-file`
+    - 判断**`/admin/reassign_partitions`**节点是否存在【存在则说明正在执行副本分配】
+    - 若**`/admin/reassign_partitions`**节点不存在则通过当前副本分配结果与预期分配是否一致来判断
+
 - `PreferredReplicaLeaderElectionCommand`优先副本分配
 
   - 判断`path-to-json-file`是否有指定文件，解析成`TopicPartition`
