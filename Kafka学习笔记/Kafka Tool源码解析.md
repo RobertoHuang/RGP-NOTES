@@ -1,4 +1,5 @@
 - `handleCreateTopicsRequest`处理创建`Topic`请求
+
   - 判断`Controller`是否转移及授权认证校验【`controller.isActive`】
   - 将请求创建的`Topic`进行分类【`validTopics`、`duplicateTopics`】
   - 调用`AdminManager.createTopics`执行真正的创建`Topic`流程
@@ -53,32 +54,49 @@
 
 **以上相关命令本质都是修改`ZK`节点的数据，并未真正执行有效的操作【有效业务逻辑都由`Controller`监听`ZK`节点变化完成，该部分将在`Controller`部分展开介绍】**
 
+## `kafka-consumer-groups.sh`消费组相关操作
 
+消费组实际操作委托给了`ConsumerGroupCommand`完成，`ConsumerGroupCommand.describeConsumerGroup`方法为消费组相关操作提供了基础，它用于查询消费组的基础信息，流程如下
 
-- `ConsumerGroupCommand`消费组相关操作
-  - 获取消费组基础信息
-    - 发送`FindCoordinatorRequest`请求查找`coordinator`所在`Broker`
-    - 发送`DescribeGroupsRequest`请求查找消费组基础信息，封装为`ConsumerGroupSummary`返回【`ConsumerGroupSummary`包含组状态及策略、组成员信息、所在`Broker`等】
-  - `--list`查询消费组列表
-    - 往`Broker`发送`ListGroupsRequest`请求查询消费组列表
-  - `--describe`获取指定组信息
-    - `--offsets`获取消费组对应`offset`信息
-      - 获取消费组基础信息
-      - 往消费组所在`Broker`发送`OffsetFetchRequest`获取指定`Group`的`Offset`信息
-      - 获取消费组所有`TopicPartition`对应的`offset`信息封装成`PartitionAssignmentState` 【`PartitionAssignmentState`包含`Offset`信息及`LEO`信息【可以算出`Lag`:滞后消费多少】
-    - `--members`获取消费组对应成员信息
-      - 获取消费组基础信息，封装成组成员信息`MemberAssignmentState`并返回
-    - `--state`获取消费组对应状态信息
-      - 获取消费组基础信息，封装成组状态信息`GroupState`并返回
-  - `--reset-offsets`重置`Offset`
-    - 获取消费组基础信息【仅能修改组状态为`Empty`和`Dead`的`Offset`】
-    - 获取需要重置`Offset`的`TopicPartition`信息【可以手动指定】
-    - 根据策略计算出需要将`Offset`重置为何值
-      - ` --to-earliest` - 把位移调整到分区当前最小位移
-      - `--to-latest` - 把位移调整到分区当前最新位移
-      - ` --to-current` - 把位移调整到分区当前位移
-      - `--to-offset` - 把位移调整到指定位移处
-      - `--shift-by` - 把位移调整到当前位移 + N处，注意N可以是负数，表示向前移动
-      - `--to-datetime` - 把位移调整到大于给定时间的最早位移处
-      - `--by-duration` - 把位移调整到距离当前时间指定间隔的位移处
-      - ` --from-file` - 从`CSV`文件中读取调整策略
+> 发送`FindCoordinatorRequest`查找`coordinator`所在`Broker`
+>
+> 发送`DescribeGroupsRequest`请求查找消费组基础信息，封装为`ConsumerGroupSummary`返回
+>
+> 【`ConsumerGroupSummary`包含组消费组状态、分配策略、消费组成员、消费组所在`Broker`等信息】
+
+- `--list`查询消费组列表
+
+  - 往`Broker`发送`ListGroupsRequest`请求查询消费组列表
+
+- `--describe`获取指定组信息
+
+  - `--state`获取消费组对应状态信息
+    - 获取消费组基础信息，封装成组状态信息`GroupState`并返回
+  - `--members`获取消费组对应成员信息
+    - 获取消费组基础信息，封装成组成员信息为`MemberAssignmentState`集合并返回
+  - `--offsets`获取消费组对应`offset`信息
+    - 获取消费组基础信息【主要是为了获取消费组所在`Broker`及组成员信息】
+    - 往消费组所在`Broker`发送`OffsetFetchRequest`获取指定`Group`的`Offset`信息
+    - 按消费者分组获取`TopicPartition`对应的`offset`信息封装成`PartitionAssignmentState` 集合
+    - 【`PartitionAssignmentState`包含`Offset`信息及`LEO`信息【可以算出`Lag`:当前滞后消费多少】
+
+- `--reset-offsets`重置`Offset`信息
+
+  - 获取消费组基础信息【仅能修改组状态为`Empty`和`Dead`的`Offset`】
+
+  - 获取需要重置`Offset`的`TopicPartition`信息【`--all-topics`或`--topic test-topic:1,2,3`】
+
+  - 根据策略计算出需要将`Offset`重置为何值【用于最终提交`Offset`使用】，以下是`Kafka`提供的策略
+
+    |    指令     |                           含义                            |
+    | :---------: | :-------------------------------------------------------: |
+    | to-earliest |               把位移调整到分区当前最小位移                |
+    |  to-latest  |               把位移调整到分区当前最新位移                |
+    | to-current  |                 把位移调整到分区当前位移                  |
+    |  to-offset  |                  把位移调整到指定位移处                   |
+    |  shift-by   | 把位移调整到当前位移 + N处，注意N可以是负数，表示向前移动 |
+    | to-datetime |           把位移调整到大于给定时间的最早位移处            |
+    | by-duration |         把位移调整到距离当前时间指定间隔的位移处          |
+    |  from-file  |                  从CSV文件中读取调整策略                  |
+
+  - 确定方案【`--dry-run`，`--execute`判断是否真正执行重置`Offset`操作，`--export`导出执行结果】
