@@ -1,4 +1,17 @@
-# 副本备份机制
+# 副本机制
+
+> `Kafka`从`0.8`版本开始引入副本`Replica`的机制，其目的是为了增加`Kafka`集群的高可用性
+>
+> 其中`Leader`副本负责读写，`Follower`副本负责从`Leader`拉取数据做热备，副本分布在不同的`Broker`上
+>
+> 
+>
+> `AR(Assigned Replica)`:副本集合(`Leader+Follower`的总和)
+>
+> `ISR(IN-SYNC Replica)`:同步副本集表示目前可用`Alive`且消息量与`Leader`相差不多的副本集合
+>
+> - 副本所在节点必须维持着与`Zookeeper`连接
+> - 副本最后一条消息的`Offset`与`Leader`副本的最后一条消息的`Offset`之间差值不能超过指定阈值
 
 ## `Replica`
 
@@ -30,11 +43,9 @@
 
 - `checkEnoughReplicasReachOffset`检查是否足够多的`Follower`副本已同步消息
 
-## `ReplicaManager`
+## ReplicaManager副本管理器
 
 - `becomeLeaderOrFollower`更新副本为`Leader/Follow`副本
-- `makeLeaders`将指定分区的`Local Replica`切换为`Leader`
-- `makeFollowers`将指定分区的`Local Replica`切换为`Follower`【会启动同步消息线程】
 - `appendToLocalLog`追加消息
   - 检测目标`Topic`是否是`Kafka`的内部`Topic`及是否允许向内部`Topic`追加数据
   - 根据`topicPartition`获取对应的`Partition`【`Partition`是否存在及是否是`OfflinePartition`】
@@ -47,9 +58,6 @@
 - `updateFollowerLogReadResults` `Follower`副本读取消息结束后操作
   - 更新`Leader`副本上维护的`Follower`副本的各项状态
   - 随着`Follower`不断`fetch`消息最终追上`Leader`副本，可能对`ISR`集合进行扩张【尝试更新`HW`】
-- `stopReplicas`关闭副本
-  - 停止对指定分区的`Fetch`操作
-  - 调用`stopReplica()`关闭指定的分区副本【判断是否需要删除`Log`】
 - 定时任务
   - `checkpointHighWatermarks`将`HW`的值刷新到`replication-offset-checkpoint`中
   - `maybePropagateIsrChanges`定期将`ISR`集合发送变化的分区记录到`Zookeeper`中
@@ -58,79 +66,136 @@
     - 上次写入`Zookeeper`时间距今已超过60秒
 - `maybeUpdateMetadataCache`更新集群缓存
 
-## `ReplicaFetcherManager`
+`OffsetCheckPoint`:用于管理`Offset`相关文件
 
-- `addFetcherForPartitions`添加副本同步任务
-  - 根据`Leader Broker`和分区编号进行分组【同个`Leader Broker`下的几个`topicAndPartition`一组】
-  - 对于每个`BrokerAndFetcherId`分配一个`FetcherThread`【如果不存在则创建】
-  - 调用`FetcherThread.addPartitions`给该线程添加`Fetch`任务
-- `removeFetcherForPartitions`停止指定副本同步任务
-  - 调用`FetcherThread.removePartitions`删除指定的`Fetch`任务
-  - 【若`Fetcher`线程不再为任何`Follower`副本进行同步将在`shutdownIdleFetcherThreads`中被停止】
+- `replication-offset-checkpoint`:以`TopicPartion`为`Key`记录`HW`的值
 
-## `ReplicaFetcherThread`
+  `HW`为已经复制到所有`Replica`的最后提交的`Offset`，`replication-offset-checkpoint`文件结构如下
 
-- `addPartitions`添加副本同步任务
+  >第一行: 版本号
+  >
+  >第二行:当前写入`TopicPartition`的记录个数
+  >
+  >其他每行格式:`Topic Partition Offset`，如:`topic-test 0 0`
 
-  - 添加需要同步的`TopicPartition`信息及开始同步的`offset`
-  - 如果提供的`offset`则通过`handleOffsetOutOfRange`来获取有效的初始`offset`
+- `recovery-point-offset-checkpoint`:
 
-- `removePartitions`删除副本同步任务
+##  数据同步
 
-  - 删除需要同步的`TopicPartition`信息
+### 数据同步线程
 
-- `handleOffsetOutOfRange`处理`Follower`副本请求的`offset`超过`leader`副本的`offset`范围
+- `AbstractFetcherThread`数据同步线程抽象类
 
-  > 可能情况:【`leader的LEO`<`Follow`副本请求的`offset`<`leader`最小`offset`】
+  - `addPartitions(Map[TopicAndPartition, Long])`添加需要抓取的`TopicPartition`信息
 
-  - `Leader LEO`<`Follow LEO`
+  - `removePartitions(Set[TopicPartition])`删除指定`TopicPartition`副本的抓取任务
 
-    ```reStructuredText
-    1.一个Follower副本发生宕机而Leader副本不断接收来自生产者的消息并追加到Log中，此时Follower副本因为宕机并没有与Leader副本进行同步【Follower副本数据远落后于Leader副本】
-    2.此Follower副本重新上线，在它与Leader副本完全同步之前它还没有资格进入ISR集合，假设ISR集合中的Follower副本在此时全部宕机，只能选举此Follower副本为新的Leader副本
-    3.Leader副本重新上线成为Follower副本，此时就会出现Follower副本的LEO超越了Leader副本的LEO
-    ```
+  - `delayPartitions(Iterable[TopicPartition], Long)`延迟抓取
 
-    - 根据配置决定是否需要停机【`unclean.leader.election.enable`】
-    - 将分区对应的`Log`截断到`Leader`副本的`LEO`位置
-
-  - `Follow LEO`<`Leader startOffset`
+  - `doWork()`:线程执行体，构造并同步发送`FetchRequest`，接收并处理`FetchResponse`
 
     ```reStructuredText
-    如果Follower副本宕机后过了很长时间才重新上线，Leader副本在此期间可能执行了多次log retention任务来删除陈旧的日志，这就可能导致Leader副本中的StartOffset大于Follow副本的LEO
+    1.buildFetchRequest创建数据抓取请求
+    
+    2.processFetchRequest发送并处理请求响应，最终写入副本的Log实例中
+        2.1.同步发送请求获取响应【发送fetch请求失败则会退避replica.fetch.backoff.ms时间】
+        2.2.结果返回期间可能发生日志截断或分区被删除重加等操作，因此这里只对offset与请求offset一致并且PartitionFetchState的状态为isReadyForFetch进行处理。调用processPartitionData()方法将拉取到的消息追加到本地副本的日志文件中，如果返回结果有错误消息就对相应错误进行相应的处理
+        
+    3.更新PartitionStates【Follower会根据自身拥有多少个需要同步的TopicPartition来创建对应的PartitionFetchState，这个东西记录了从Leader的哪个Offset开始获取数据】
     ```
 
-    - 将`Log`全部截断并创建新的`activeSegment`
+- `ReplicaFetcherThread`副本数据同步线程
 
-- `handlePartitionsWithErrors`将对应分区的同步操作暂停【`PartitionFetchState`置为`delay`】
+  - `processPartitionData`处理抓取线程返回的数据
 
-- `doWork`线程执行体【同步任务】
+    ```reStructuredText
+    1.将获取到的消息集合追加到Log中
+    
+    2.更新本地副本的HW【本地副本的LEO和返回结果中Leader的HW值取较小值作为本地副本HW】
+    
+    3.更新本地副本的LSO【若返回结果中Leader的LSO值大于本地副本的LSO则更新本地副本的LSO值】
+    ```
 
-  > `ReplicaFetcherThread`继承自`AbstractFetcherThread`继承自`ShutdownableThread`，其核心业务代码在`doWork()`方法中【创建`FetchRequest`进行副本同步，如果没有需要进行同步的任务则退避】
+  - `handleOffsetOutOfRange`处理`Follower`副本请求的`offset`超过`leader`副本的`offset`范围
 
-  - `buildFetchRequest`创建同步请求
-  - `processFetchRequest`发送并处理请求响应
-    - 同步发送请求获取响应
-    - 结果返回期间可能发生日志截断或者分区被删除重加等操作，因此这里只对`offset`与请求`offset`一致并且`PartitionFetchState`的状态为`isReadyForFetch`的情况下进行处理
-    - 调用子类实现的`processPartitionData()`方法处理返回结果【将获取的消息集合追加到`Log`中】
-      - `processPartitionData`处理返回结果
-        - 将获取的消息集合追加到`Log`中
-        - 更新本地副本`highWatermark`【本地副本的`logEndOffset.messageOffset`和返回结果`partitionData.highWatermark`中取较小值作为本地副本`highWatermark`】
-        - 更新本地副本`logStartOffset`【根据`leaderLogStartOffset`来进行判断】
-    - 更新`TopicPartition`对应的`PartitionFetchState`信息
+    ```reStructuredText
+    handleOffsetOutOfRange方法主要处理如下两种情况:
+        1.假如当前本地id=1的副本现在是Leader其LEO假设为1000，而另一个在ISR的副本id=2其LEO为800，此时出现网络抖动id=1的机器掉线后又上线，但此时副本的Leader实际上已经变成了id=2的机器，而id=2的机器LEO为800，这时候id=1的机器启动副本同步线程去id=2上机器拉取数据，希望从offset=1000的地方开始拉取，但是id=2的机器最大的offset才是800
+    
+        2.假设一个Replica(id=1)其LEO是10，它已经掉线好几天了，这个Partition的Leader的Offset范围是[100~800]，那么当id=1的机器重新启动时，它希望从offset=10的地方开始拉取数据，这时候就发生了OutOfRange，不过跟上面不同的是这里是小于Leader的Offset范围
+    
+    handleOffsetOutOfRange方法针对两种情况提供的解决方案:
+        1.如果Leader的LEO小于当前的LEO，则对本地log进行截断(截断到Leader的LEO)
+    
+        2.如果Leader的LEO大于当前的LEO则说明有有效的数据可以同步，接下来要判断从哪里开始同步。如果Follow宕机比较久后再启动，可能Leader已经对部分日志进行清理，当前副本的LEO小于Leader副本的LSO的情况，当前副本需要截断所有日志并滚动新日志与Leader进行同步
+    ```
 
-## `NetworkClientUtils`
+  - `handlePartitionsWithErrors`将对应分区的同步操作暂停【`PartitionFetchState`置为`delay`】
 
-- `awaitReady`阻塞等待直到指定`Node`处于`Ready`状态
-- `sendAndReceive`发送请求后阻塞等待数据响应
+### 数据同步线程管理器
 
-## `MetadataCache`
+- `AbstractFetcherManager`数据同步线程管理器抽象类
 
-用来缓存整个集群中全部分区状态的组件
+  `fetcherThreadMap KEY:BrokerIdAndFetcherId VALUE:AbstractFetcherThread`:实现消息的拉取由`AbstractFetcherThread`负责，`fetcherThreadMap `保存了`BrokerIdAndFetcherId`与同步线程关系
 
-- `updateCache`更新集群元数据
+  - `addFetcherForPartitions(Map[TopicPartition, BrokerAndInitialOffset])`添加副本同步任务
 
-- `getTopicMetadata`获取元数据
+    ```reStructuredText
+    1.计算出Topic-Partition对应的fetcher id
+    
+    2.根据BrokerIdAndFetcherId获取对应的replica fetcher线程(若无调用createFetcherThread创建新的fetcher线程)，将Topic-Partition记录到FetcherTheadMap中(这个变量记录了每个Replica Fetcher线程需要同步的Topic-Partition列表
+    ```
+
+  - `removeFetcherForPartitions(Set[TopicPartition])`停止指定副本同步任务
+
+    ```reStructuredText
+    1.调用FetcherThread.removePartitions删除指定的Fetch任务
+    
+    2.若Fetcher线程不再为任何Follower副本进行同步将在shutdownIdleFetcherThreads中被停止
+    ```
+
+  - `shutdownIdleFetcherThreads()`某些同步线程负责同步的`TopicPartition`数量为0则停止该线程
+
+  - `closeAllFetchers()`停止所有抓取线程
+
+  - `createFetcherThread(fetcherId: Int, sourceBroker: BrokerEndPoint)`创建同步线程
+
+- `ReplicaFetcherManager`副本数据同步线程管理器实现类 - > `ReplicaFetcherThread`
+
+  `ReplicaFetcherManager`继承`AbstractFetcherManager`实现了抽象方法`createFetcherThread`
+
+
+##  ReplicaManager副本管理器
+
+`ReplicaManager`通过对`Partition`对象的管理【`ReplicaManager.allPartitions`】来控制着` Partition `对应的`Replica`实例【`Partition.allReplicasMap`】，`Replica`实例通过`Log`对象实例管理着其底层的存储内容
+
+- `stopReplicas`关闭副本
+
+  ```reStructuredText
+  1.停止对指定分区的Fetch操作
+  
+  2.调用stopReplica()关闭指定的分区副本【判断是否需要删除Log】
+  ```
+
+- `makeFollower`将指定分区的`Local Replica`切换为`Follower`
+
+  ```reStructuredText
+  1.调用partition的makeFollower将Local Replica切换为Follower，后面就不会接受这个partition的Produce请求了，如果有Client再向这台Broker发送数据会返回相应的错误
+  
+  2.停止对这些partition的副本同步(如果本地副本之前是Follower现在还是Follower，先关闭的原因是:这些Partition的Leader发生了变化)，这样可以保证本地副本将不会有新的数据追加
+  
+  3.清空时间轮中的produce和fetch请求【tryCompleteDelayedProduce、tryCompleteDelayedFetch】
+  
+  4.若Borker没有掉线则向这些Partition的新Leader启动副本同步线程【不一定每个Partition数据同步都会启动一个Fetch线程，对于一个Broker只会启动num.replica.fetchers个线程。这个Topic-Partition会分配到哪个fetcher线程上是根据topic名和partition id进行计算得到的】
+  ```
+
+- `makeLeaders`将指定分区的`Local Replica`切换为`Leader`
+
+  ```reStructuredText
+  1.先停止对这些Partition的副本同步流程，因为这些Partition的本地副本以及被选举为Leader
+  
+  2.将这些Partition本地副本设置为Leader，并且开始更新对应的Meta信息(记录与其他Follower相关信息)
+  ```
 
 ## 关键概念【附录】
 
@@ -162,3 +227,5 @@
   1.所有Follower都会和Leader通信获取最新消息，所以由Leader来管理ISR最合适
   2.Leader副本总是包含在ISR中，只有ISR中的副本才有资格被选举为Leader
 ```
+
+
